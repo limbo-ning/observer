@@ -1,0 +1,12 @@
+user: root
+password: 
+url: tcp(127.0.0.1:3306)/wechat_service?charset=utf8
+port: 9100
+servername: wechat
+version: v1
+
+echo: 
+ - openaccount: gh_011d3f70beb3 #17趣浪
+   key: "#晚安#"
+   poolsize: 20
+   enable: false

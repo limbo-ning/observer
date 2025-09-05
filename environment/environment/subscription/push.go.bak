@@ -1,0 +1,773 @@
+package subscription
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"obsessiontech/common/encrypt"
+	"obsessiontech/common/util"
+	"obsessiontech/environment/authority"
+	"obsessiontech/environment/environment/data"
+	"obsessiontech/environment/environment/entity"
+	"obsessiontech/environment/environment/monitor"
+	"obsessiontech/environment/mission"
+	"obsessiontech/environment/peripheral"
+	"obsessiontech/environment/push"
+	"obsessiontech/environment/user"
+	"obsessiontech/environment/wechat"
+
+	wechatUtil "obsessiontech/wechat/util"
+)
+
+const (
+	STATION_STATUS = "station_status"
+	DATA_DAILY     = "data_" + data.DAILY
+	DATA_HOURLY    = "data_" + data.HOURLY
+	DATA_MINUTELY  = "data_" + data.MINUTELY
+	DATA_REAL_TIME = "data_" + data.REAL_TIME
+)
+
+func init() {
+	push.RegisterSubsciption(STATION_STATUS, func(sub *push.Subscription) push.IPush {
+		p := new(StationSubscription)
+		p.Subscription = *sub
+		return p
+	})
+	push.RegisterSubsciption(DATA_DAILY, func(sub *push.Subscription) push.IPush {
+		p := new(MonitorSubscription)
+		p.Subscription = *sub
+		return p
+	})
+	push.RegisterSubsciption(DATA_HOURLY, func(sub *push.Subscription) push.IPush {
+		p := new(MonitorSubscription)
+		p.Subscription = *sub
+		return p
+	})
+	push.RegisterSubsciption(DATA_MINUTELY, func(sub *push.Subscription) push.IPush {
+		p := new(MonitorSubscription)
+		p.Subscription = *sub
+		return p
+	})
+	push.RegisterSubsciption(DATA_REAL_TIME, func(sub *push.Subscription) push.IPush {
+		p := new(MonitorSubscription)
+		p.Subscription = *sub
+		return p
+	})
+}
+
+type StationSubscription struct {
+	push.Subscription
+	Entity   *entity.Entity
+	Station  *entity.Station
+	Duration string
+}
+
+func (s *StationSubscription) GetSubscriptionType() string {
+	return s.Type
+}
+func (s *StationSubscription) GetPushType() string {
+	return s.Push
+}
+func (s *StationSubscription) ShouldPush(siteID string) error {
+	if _, _, err := s.PushInterval.GetInterval(time.Now(), true); err != nil {
+		return err
+	}
+	return nil
+}
+
+type MonitorSubscription struct {
+	push.Subscription
+	Entity   *entity.Entity
+	Station  *entity.Station
+	Time     time.Time
+	DataList []data.IData
+}
+
+func (s *MonitorSubscription) GetSubscriptionType() string {
+	return s.Type
+}
+func (s *MonitorSubscription) GetPushType() string {
+	return s.Push
+}
+func (s *MonitorSubscription) ShouldPush(siteID string) error {
+	if _, _, err := s.PushInterval.GetInterval(time.Now(), true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func getSMSName(name string) string {
+	if utf8.RuneCountInString(name) < 20 {
+		return name
+	}
+
+	name = strings.ReplaceAll(name, "有限责任公司", "")
+	name = strings.ReplaceAll(name, "有限公司", "")
+	name = strings.ReplaceAll(name, "公司", "")
+
+	if utf8.RuneCountInString(name) < 20 {
+		return name
+	}
+
+	return string([]rune(name)[:17]) + "..."
+}
+
+//Implement AliSmsPush interface
+func (s *StationSubscription) GetMobile(siteID string) (string, error) {
+	if s.SubscriberType == "user" {
+		u, err := user.GetUser(siteID, "id", s.SubscriberID)
+		if err != nil {
+			log.Println("error push subscription: ", err, s)
+			return "", err
+		}
+		if u.Mobile == "" {
+			return "", errors.New("用户未设置手机号")
+		}
+		return u.Mobile, nil
+	} else if s.SubscriberType == "entity" || s.SubscriberType == "station" {
+		mobile, exists := s.Ext["mobile"]
+		if !exists {
+			return "", errors.New("未设置推送号码")
+		}
+		mobileS, ok := mobile.(string)
+		if !ok {
+			return "", errors.New("不正常的推送号码")
+		}
+		return mobileS, nil
+	} else if s.SubscriberType == "role" {
+		return "", errors.New("角色类不应直接推送")
+	}
+
+	return "", push.E_invalid_subsriber
+}
+
+func (s *StationSubscription) GetTemplateCode(siteID string) (string, error) {
+	return Config.EnvironmentSMSStationPushTemplateCode, nil
+}
+
+func (s *StationSubscription) GetSignature(siteID string) (string, error) {
+
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.SMSSignature == "" {
+		return "", errors.New("未设置短信签名")
+	}
+	return m.SMSSignature, nil
+}
+
+func (s *StationSubscription) GetSMSParam(siteID string) (map[string]string, error) {
+	param := make(map[string]string)
+	param["stationName"] = getSMSName(fmt.Sprintf("%s-%s", s.Entity.Name, s.Station.Name))
+	param["duration"] = s.Duration
+	return param, nil
+}
+
+func (s *MonitorSubscription) GetMobile(siteID string) (string, error) {
+	if s.SubscriberType == "user" {
+		u, err := user.GetUser(siteID, "id", s.SubscriberID)
+		if err != nil {
+			log.Println("error push subscription: ", err, s)
+			return "", err
+		}
+		if u.Mobile == "" {
+			return "", errors.New("用户未设置手机号")
+		}
+		return u.Mobile, nil
+	} else if s.SubscriberType == "entity" || s.SubscriberType == "station" {
+		mobile, exists := s.Ext["mobile"]
+		if !exists {
+			return "", errors.New("未设置推送号码")
+		}
+		mobileS, ok := mobile.(string)
+		if !ok {
+			return "", errors.New("不正常的推送号码")
+		}
+		return mobileS, nil
+	} else if s.SubscriberType == "role" {
+		return "", errors.New("角色类不应直接推送")
+	}
+
+	return "", push.E_invalid_subsriber
+}
+
+func (s *MonitorSubscription) GetTemplateCode(siteID string) (string, error) {
+	return Config.EnvironmentSMSDataPushTemplateCode, nil
+}
+
+func (s *MonitorSubscription) GetSignature(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.SMSSignature == "" {
+		return "", errors.New("未设置短信签名")
+	}
+	return m.SMSSignature, nil
+}
+
+func (s *MonitorSubscription) GetSMSParam(siteID string) (map[string]string, error) {
+	param := make(map[string]string)
+	param["stationName"] = getSMSName(fmt.Sprintf("%s-%s", s.Entity.Name, s.Station.Name))
+	param["time"] = util.FormatDateTime(s.Time)
+
+	switch s.Type {
+	case DATA_REAL_TIME:
+		param["dataType"] = "实时"
+	case DATA_MINUTELY:
+		param["dataType"] = "分时"
+	case DATA_HOURLY:
+		param["dataType"] = "小时"
+	case DATA_DAILY:
+		param["dataType"] = "日均"
+	}
+
+	monitorIDs := make([]int, 0)
+	for _, d := range s.DataList {
+		monitorIDs = append(monitorIDs, d.GetMonitorID())
+	}
+	monitors, err := monitor.GetMonitors(siteID, nil, nil, monitorIDs...)
+	if err != nil {
+		return nil, err
+	}
+
+	monitorNameList := make([]string, 0)
+	for _, m := range monitors {
+		monitorNameList = append(monitorNameList, m.Name)
+	}
+
+	param["monitor"] = strings.Join(monitorNameList, ",")
+
+	return param, nil
+}
+
+//Implement WxOpenTemplatePush interface
+func (s *StationSubscription) GetAccessToken(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxOpenAppID == "" {
+		log.Println("error push subscription: openAppID not set")
+		return "", errors.New("未配置appID")
+	}
+	accessToken, err := wechat.GetAgentAccessToken(m.WxOpenAppID)
+	if err != nil {
+		log.Println("error get access token: ", err)
+		return "", err
+	}
+	return accessToken, nil
+}
+func (s *StationSubscription) GetOpenID(siteID string) (string, error) {
+	if wxUserInfo, exists := s.Ext["wxUserInfo"]; exists {
+		wxUserInfoS, ok := wxUserInfo.(string)
+		if !ok {
+			return "", errors.New("不正常的微信用户信息")
+		}
+		infoData, err := encrypt.Base64Decrypt(wxUserInfoS)
+		if err != nil {
+			log.Println("error get openid from session: ", err)
+			return "", err
+		}
+		userInfo := new(wechatUtil.UserInfo)
+		if err := json.Unmarshal(infoData, userInfo); err != nil {
+			log.Println("error get openid from session key: ", err)
+			return "", err
+		}
+		return userInfo.Openid, nil
+	}
+	if s.SubscriberType == "user" {
+		u, err := user.GetUser(siteID, "id", s.SubscriberID)
+		if err != nil {
+			log.Println("error push subscription: ", err, s)
+			return "", err
+		}
+		if u.WechatID == "" {
+			log.Println("error get push openID: user has no wechatID: ", u.UserID)
+			return "", errors.New("未与微信账号绑定")
+		}
+		m, err := GetModule(siteID)
+		if err != nil {
+			log.Println("error push subscription: ", err, s)
+			return "", err
+		}
+		if info, exists := u.WechatInfo[m.WxOpenAppID]; exists {
+			openid, exists := info.(map[string]interface{})["openid"]
+			if !exists {
+				openid, exists = info.(map[string]interface{})["openId"]
+			}
+			if exists {
+				return openid.(string), nil
+			}
+		}
+		log.Println("error get push openID: user has no wechatID: ", u.UserID)
+	}
+	return "", errors.New("未与微信账号绑定")
+}
+func (s *StationSubscription) GetTemplateID(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxOpenStationTemplateID == "" {
+		log.Println("error push subscription: wxOpenStationTemplateID not set")
+		return "", errors.New("未配置公众号推送模版ID")
+	}
+	return m.WxOpenStationTemplateID, nil
+}
+func (s *StationSubscription) GetFirst(siteID string) (string, error) {
+	return "您关注的监测点失联", nil
+}
+func (s *StationSubscription) GetRemark(siteID string) (string, error) {
+	return "请及时查看", nil
+}
+func (s *StationSubscription) GetURL(siteID string) (string, error) {
+	return "", nil
+}
+func (s *StationSubscription) GetMiniappAppID(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxMiniappAppID == "" {
+		return "", nil
+	}
+	return m.WxMiniappAppID, nil
+}
+func (s *StationSubscription) GetMiniappPage(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxMiniappAppID == "" {
+		return "", nil
+	}
+	return m.WxMiniappStationPage, nil
+}
+func (s *StationSubscription) GetKeywords(siteID string) ([]string, error) {
+
+	stationName := fmt.Sprintf("%s-%s", s.Entity.Name, s.Station.Name)
+	status := fmt.Sprintf("离线超过%s", s.Duration)
+
+	return []string{stationName, status, util.FormatDateTime(time.Now())}, nil
+}
+
+func (s *MonitorSubscription) GetAccessToken(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxOpenAppID == "" {
+		log.Println("error push subscription: openAppID not set")
+		return "", errors.New("未配置appID")
+	}
+	accessToken, err := wechat.GetAgentAccessToken(m.WxOpenAppID)
+	if err != nil {
+		log.Println("error get catering notice template setting: get access token: ", err)
+		return "", err
+	}
+	return accessToken, nil
+}
+func (s *MonitorSubscription) GetOpenID(siteID string) (string, error) {
+	if wxUserInfo, exists := s.Ext["wxUserInfo"]; exists {
+		wxUserInfoS, ok := wxUserInfo.(string)
+		if !ok {
+			return "", errors.New("不正常的微信用户信息")
+		}
+		infoData, err := encrypt.Base64Decrypt(wxUserInfoS)
+		if err != nil {
+			log.Println("error get openid from session: ", err)
+			return "", err
+		}
+		userInfo := new(wechatUtil.UserInfo)
+		if err := json.Unmarshal(infoData, userInfo); err != nil {
+			log.Println("error get openid from session key: ", err)
+			return "", err
+		}
+		return userInfo.Openid, nil
+	}
+	if s.SubscriberType == "user" {
+		u, err := user.GetUser(siteID, "id", s.SubscriberID)
+		if err != nil {
+			log.Println("error push subscription: ", err, s)
+			return "", err
+		}
+		if u.WechatID == "" {
+			log.Println("error get push openID: user has no wechatID: ", u.UserID)
+			return "", errors.New("未与微信账号绑定")
+		}
+		m, err := GetModule(siteID)
+		if err != nil {
+			log.Println("error push subscription: ", err, s)
+			return "", err
+		}
+		if info, exists := u.WechatInfo[m.WxOpenAppID]; exists {
+			openid, exists := info.(map[string]interface{})["openid"]
+			if !exists {
+				openid, exists = info.(map[string]interface{})["openId"]
+			}
+			if exists {
+				return openid.(string), nil
+			}
+		}
+		log.Println("error get push openID: user has no wechatID: ", u.UserID)
+	}
+	return "", errors.New("未与微信账号绑定")
+}
+func (s *MonitorSubscription) GetTemplateID(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxOpenOverproofTemplateID == "" {
+		log.Println("error push subscription: wxOpenStationTemplateID not set")
+		return "", errors.New("未配置公众号推送模版ID")
+	}
+	return m.WxOpenOverproofTemplateID, nil
+}
+func (s *MonitorSubscription) GetFirst(siteID string) (string, error) {
+	switch s.Type {
+	case DATA_DAILY:
+		return "您关注的监测点日平均数据异常", nil
+	case DATA_HOURLY:
+		return "您关注的监测点小时平均数据异常", nil
+	case DATA_MINUTELY:
+		return "您关注的监测点分时平均数值异常", nil
+	case DATA_REAL_TIME:
+		return "您关注的监测点实时数据异常", nil
+	}
+	return "", errors.New("未实现的类型")
+}
+func (s *MonitorSubscription) GetRemark(siteID string) (string, error) {
+	return "请进入预警平台查看", nil
+}
+func (s *MonitorSubscription) GetURL(siteID string) (string, error) {
+	return "", nil
+}
+func (s *MonitorSubscription) GetMiniappAppID(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxMiniappAppID == "" {
+		return "", nil
+	}
+	return m.WxMiniappAppID, nil
+}
+func (s *MonitorSubscription) GetMiniappPage(siteID string) (string, error) {
+	m, err := GetModule(siteID)
+	if err != nil {
+		log.Println("error push subscription: ", err, s)
+		return "", err
+	}
+	if m.WxMiniappAppID == "" {
+		return "", nil
+	}
+	return m.WxMiniappStationPage, nil
+}
+func (s *MonitorSubscription) GetKeywords(siteID string) ([]string, error) {
+
+	stationName := fmt.Sprintf("%s-%s", s.Entity.Name, s.Station.Name)
+	dataTime := util.FormatDateTime(s.Time)
+
+	var detail string
+	for _, d := range s.DataList {
+
+		var value float64
+
+		if rtd, ok := d.(data.IRealTime); ok {
+			value = rtd.GetRtd()
+		} else if interval, ok := d.(data.IInterval); ok {
+			value = interval.GetAvg()
+		} else {
+			log.Println("error unknown data interface to push")
+			continue
+		}
+
+		m := monitor.GetMonitor(siteID, d.GetMonitorID())
+		if m == nil {
+			log.Println("error monitor not found to push: ", d.GetStationID(), d.GetMonitorID())
+			continue
+		}
+		l := monitor.GetFlagLimit(siteID, d.GetStationID(), d.GetMonitorID(), d.GetFlag())
+		if l == nil {
+			log.Println("error monitor flag limit not found to push: ", d.GetStationID(), d.GetMonitorID(), d.GetFlag())
+			continue
+		}
+
+		flag, err := monitor.GetFlag(siteID, d.GetFlag())
+		if err != nil {
+			continue
+		}
+
+		if flag == nil {
+			continue
+		}
+
+		if monitor.CheckFlag(monitor.FLAG_DATA_INVARIANCE, flag.Bits) {
+			detail += fmt.Sprintf("%s %s %G(%s小时)\n", m.Name, flag.Name, value, l.Region)
+		} else {
+			if l.Region != "" {
+				detail += fmt.Sprintf("%s %s %G(%s)\n", m.Name, flag.Name, value, l.Region)
+			} else {
+				detail += fmt.Sprintf("%s %s %G %s\n", m.Name, flag.Name, value, flag.Description)
+			}
+		}
+	}
+
+	return []string{stationName, dataTime, detail}, nil
+}
+
+//speaker interface
+func (s *MonitorSubscription) GetDeviceIDs(siteID string) ([]int, error) {
+
+	if s.SubscriberType == "entity" {
+
+		stations, err := entity.GetStations(siteID, nil, []int{s.SubscriberID}, entity.ACTIVE, "", "")
+		if err != nil {
+			return nil, err
+		}
+
+		stationIDs := make([]string, 0)
+		for _, s := range stations {
+			stationIDs = append(stationIDs, fmt.Sprintf("%d", s.ID))
+		}
+
+		deviceList, _, err := peripheral.GetDevices(siteID, authority.ActionAuthSet{{Action: peripheral.ACTION_ADMIN_VIEW}}, "", peripheral.DEVICE_SPEAKER, "", 0, -1, "", "environment_entity#station", stationIDs...)
+		if err != nil {
+			return nil, err
+		}
+
+		result := make([]int, 0)
+		for _, d := range deviceList {
+			result = append(result, d.ID)
+		}
+
+		return result, nil
+
+	} else if s.SubscriberType == "station" {
+		deviceList, _, err := peripheral.GetDevices(siteID, authority.ActionAuthSet{{Action: peripheral.ACTION_ADMIN_VIEW}}, "", peripheral.DEVICE_SPEAKER, "", 0, -1, "", "environment_entity#station", fmt.Sprintf("%s", s.SubscriberID))
+		if err != nil {
+			return nil, err
+		}
+
+		result := make([]int, 0)
+		for _, d := range deviceList {
+			result = append(result, d.ID)
+		}
+
+		return result, nil
+	}
+
+	return nil, errors.New("不支持的订阅者")
+}
+
+func (s *MonitorSubscription) GetResourceURI(siteID string) (string, error) {
+
+	resourceURI, exists := s.Ext["resourceURI"]
+	if !exists {
+		return "", nil
+	}
+
+	uri, ok := resourceURI.(string)
+	if !ok {
+		return "", errors.New("音频资源错误")
+	}
+
+	return uri, nil
+}
+
+func (s *MonitorSubscription) GetResourceURL(siteID string) (string, error) {
+	resourceURL, exists := s.Ext["resourceURL"]
+	if !exists {
+		return "", nil
+	}
+
+	url, ok := resourceURL.(string)
+	if !ok {
+		return "", errors.New("音频链接错误")
+	}
+
+	return url, nil
+}
+
+func (s *MonitorSubscription) GetRepeat(siteID string) (int, error) {
+	repeat, exists := s.Ext["repeat"]
+	if !exists {
+		return 1, nil
+	}
+
+	repeatInt, ok := repeat.(int)
+	if !ok {
+		return 0, errors.New("播放次数错误")
+	}
+
+	return repeatInt, nil
+}
+
+//mission interface
+func (s *StationSubscription) GetMission(siteID string) (*mission.Mission, error) {
+
+	if s.SubscriberType == "user" {
+		return nil, errors.New("不支持用户订阅")
+	}
+
+	missionType, exists := s.Ext["type"]
+	if exists {
+		return nil, errors.New("未配置任务类型")
+	}
+
+	missionTypeS, ok := missionType.(string)
+	if !ok {
+		return nil, errors.New("任务类型不正确")
+	}
+
+	sm := new(mission.Mission)
+	sm.Type = missionTypeS
+
+	sm.Name = fmt.Sprintf("%s-%s 失联", s.Entity.Name, s.Station.Name)
+	sm.Description = s.Duration
+
+	relateID := make(map[string]string)
+	relateID["entityID"] = fmt.Sprintf("%d", s.Entity.ID)
+	relateID["stationID"] = fmt.Sprintf("%d", s.Station.ID)
+
+	sm.RelateID = relateID
+
+	if err := sm.Validate(siteID); err != nil {
+		return nil, err
+	}
+
+	return sm, nil
+}
+
+func (s *StationSubscription) GetMissionEmpowers(siteID string) (map[string]map[string][]string, error) {
+
+	var result map[string]map[string][]string
+
+	empowers, exists := s.Ext["empowers"]
+	if !exists {
+		return result, nil
+	}
+
+	if err := util.Clone(empowers, &result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (s *MonitorSubscription) GetMission(siteID string) (*mission.Mission, error) {
+	if s.SubscriberType == "user" {
+		return nil, errors.New("不支持用户订阅")
+	}
+
+	missionType, exists := s.Ext["type"]
+	if exists {
+		return nil, errors.New("未配置任务类型")
+	}
+
+	missionTypeS, ok := missionType.(string)
+	if !ok {
+		return nil, errors.New("任务类型不正确")
+	}
+
+	sm := new(mission.Mission)
+	sm.Type = missionTypeS
+
+	stationName := fmt.Sprintf("%s-%s", s.Entity.Name, s.Station.Name)
+
+	switch s.Type {
+	case DATA_DAILY:
+		sm.Name = fmt.Sprintf("%s 日均数据异常", stationName)
+	case DATA_HOURLY:
+		sm.Name = fmt.Sprintf("%s 时均数据异常", stationName)
+	case DATA_MINUTELY:
+		sm.Name = fmt.Sprintf("%s 分均数据异常", stationName)
+	}
+
+	detail := util.FormatDateTime(s.Time)
+
+	for _, d := range s.DataList {
+		var value float64
+
+		if rtd, ok := d.(data.IRealTime); ok {
+			value = rtd.GetRtd()
+		} else if interval, ok := d.(data.IInterval); ok {
+			value = interval.GetAvg()
+		} else {
+			log.Println("error unknown data interface to push")
+			continue
+		}
+
+		m := monitor.GetMonitor(siteID, d.GetMonitorID())
+		if m == nil {
+			log.Println("error monitor not found to push: ", d.GetStationID(), d.GetMonitorID())
+			continue
+		}
+		l := monitor.GetFlagLimit(siteID, d.GetStationID(), d.GetMonitorID(), d.GetFlag())
+		if l == nil {
+			log.Println("error monitor flag limit not found to push: ", d.GetStationID(), d.GetMonitorID(), d.GetFlag())
+			continue
+		}
+
+		flag, err := monitor.GetFlag(siteID, d.GetFlag())
+		if err != nil {
+			continue
+		}
+
+		if flag == nil {
+			continue
+		}
+
+		if monitor.CheckFlag(monitor.FLAG_DATA_INVARIANCE, flag.Bits) {
+			detail += fmt.Sprintf("%s %s %G(%s小时)\n", m.Name, flag.Name, value, l.Region)
+		} else {
+			if l.Region != "" {
+				detail += fmt.Sprintf("%s %s %G(%s)\n", m.Name, flag.Name, value, l.Region)
+			} else {
+				detail += fmt.Sprintf("%s %s %G %s\n", m.Name, flag.Name, value, flag.Description)
+			}
+		}
+	}
+	sm.Description = detail
+
+	relateID := make(map[string]string)
+	relateID["entityID"] = fmt.Sprintf("%d", s.Entity.ID)
+	relateID["stationID"] = fmt.Sprintf("%d", s.Station.ID)
+
+	sm.RelateID = relateID
+
+	return sm, nil
+}
+func (s *MonitorSubscription) GetMissionEmpowers(siteID string) (map[string]map[string][]string, error) {
+
+	var result map[string]map[string][]string
+
+	empowers, exists := s.Ext["empowers"]
+	if !exists {
+		return result, nil
+	}
+
+	if err := util.Clone(empowers, &result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+
+}
